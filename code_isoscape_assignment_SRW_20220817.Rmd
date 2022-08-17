@@ -1,0 +1,940 @@
+---
+title: "Isoscape assignment SRW - all breeding grounds"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: yes
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+```{r, echo=F, result="hide", include=F}
+lapply(c("plyr", "tidyverse", "raster", "sf", "ncdf4", "rnaturalearth", "rnaturalearthdata", "ggsflabel", "gridExtra", "foreach", "doParallel", "patchwork", "stars"), library, character.only=TRUE)
+
+## proj4string for coordinates systems to use throughout code
+proj_lon360 <- "+proj=longlat +ellps=WGS84 +lon_wrap=180 +datum=WGS84 +no_defs"
+proj_antarctic <- "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+sf::sf_use_s2(FALSE)
+# land polygons for plots
+world <- ne_countries(scale = "medium", returnclass = "sf") 
+world <- st_crop(world, xmin = -180, xmax = 180, ymax = -90, ymin = 0)
+world <- st_transform(world, proj_antarctic)
+```
+
+Dataset with individual samples collected in breeding grounds
+```{r}
+srw.data <- read.csv("../Data/SRW_Sample_isotope_analysis_5March21_SD.csv", stringsAsFactors = F) %>% 
+  dplyr::select(Year, Month, D13C, D15N, Locality1, Lat, Long, AgeClass) %>% 
+  filter(Locality1 != "Auckland Islands", Locality1 != "NZ Mainland") # remove the old NZ data
+
+# new data for NZ - Auckland Islands replaced the old one
+nz.data <- read.csv("../Data/NZ_SRW_SI_UniquePerYearNov2021_SD.csv") %>% 
+  dplyr::select(Year, Month, D13C, D15N, Locality1, Lat, Long, AgeClass)
+
+srw.data <- rbind(srw.data, nz.data)
+
+## remove calves and data outside the months of July-oct
+srw.data <- srw.data %>% 
+  filter(!(AgeClass %in% c("calf")) & Month >= 7 & Month <= 10)
+
+
+# how many samples
+nrow(srw.data)
+
+# separate the Argentina data into two different subgroups as well as having it as one complete breeding stock
+argentina <- srw.data %>% 
+  filter(Locality1 == "Argentina") %>% 
+  mutate(Locality1 = case_when(D15N > 10 ~ "Argentina_d15Nhigh",
+                               D15N <= 10 ~ "Argentina_d15Nlow"))
+table(argentina$Locality1)
+srw.data <- rbind(srw.data, argentina)
+
+# add X at the beginning of the sample name because the raster function cannot use numerical variables as names for the layers
+# sampleID had too many special characters that were not recognized in the raster function
+srw.data$Sample  <- paste("X", seq(1, nrow(srw.data), 1), sep = "")
+
+# verify that Sample numbers are unique to each row in the dataframe
+nrow(srw.data)
+length(unique(srw.data$Sample))
+
+# convert data to spatial format and project
+srw.sf <- st_as_sf(srw.data, coords = c("Long", 'Lat'), crs = 4326) %>%
+  st_transform(crs = st_crs(proj_antarctic)) 
+
+# breeding sites names in spatial format
+labels_sites <- srw.sf %>%
+  group_by(Locality1) %>%
+  summarize()
+# make the names matches with those in the raster
+labels_sites$Locality <-labels_sites$Locality1 
+```
+
+Load phytoplankton base rasters
+```{r}
+load("../2-Tunning_with_tracks/Outputs/D13C_ras.RData")
+load("../2-Tunning_with_tracks/Outputs/D15N_ras.RData")
+```
+
+
+Set up a plot template
+```{r}
+gbase <- ggplot() +
+  scale_fill_viridis_c(na.value = "transparent", option = "viridis", 
+                       name = "Mean probability of origin \nacross individuals", direction = -1) +
+  coord_sf(label_graticule = "") +
+  theme_grey() +
+  theme(legend.position = "bottom") +
+  xlab("") + ylab("")
+```
+
+# Creating individual rasters for assignment
+
+## Check out temporal distribution of samples
+```{r}
+g <- ggplot(srw.data, aes(as.factor(Month), fill = Locality1)) +
+  geom_bar() +
+  facet_wrap(~Locality1, scales = "free_y") +
+  ylab("Number of samples") +
+  xlab("Month")
+g
+ggsave("./Outputs/srw.data_sample_distribution.png", width = 7, height = 5)
+```
+
+
+## Averaging rasters per Individual
+
+For each locality, retrieve relevant monthly layers of D13C and D15N (3 to 5 months prior to date of sample collection). This chunk needs a few minutes to run on my computer.
+```{r, eval = F}
+# the names of the layer are funky because the time in the netcdf was in decimal years. But we can still easily access the year so that's enough
+head(names(D13C_ras))
+head(substr(names(D13C_ras), 2, 5))
+# For this I assumed that the netcdf contained one layer per month per year since January 1992. If there are gaps in this time series, it will mess up the assignment in the loop below. Important to check this is correct.
+srw.ras.nonmasked <- dlply(srw.data, ~Sample, function(d){ # for each sample
+  # month of the sample
+  m <- d$Month[1]
+  # selecting the relevant layers from that year
+  n <- names(D13C_ras)[substr(names(D13C_ras), 2, 5) == d$Year[1]]
+  # selecting only the fifth, fourth, and third month prior to sample
+  n <- n[(m-5):(m-3)]
+  # retrieving these layers from the rasterbrick
+  ras13mean <- mean(D13C_ras[[n]], na.rm = F)
+  ras13sd <- calc(D13C_ras[[n]], function(r) sd(r))
+  ras15mean <- mean(D15N_ras[[n]], na.rm = F)
+  ras15sd <- calc(D15N_ras[[n]], function(r) sd(r))
+  # stack the four rasters together
+  r <- stack(ras13mean, ras13sd, ras15mean, ras15sd)
+  # set names to something more explicit
+  names(r) <- c("D13Cmean", "D13Csd", "D15Nmean", "D15Nsd")
+  return(r)
+})
+
+# Saving these individual Rasters stack (without masking)
+save(srw.ras.nonmasked, file = "./Outputs/srw.ras.nonmasked.RData")
+```
+
+Check out an example
+```{r, fig.cap = "3-month average of phytoplankton isoscape prior to sample taken in Argentina breeding grounds.", fig.align="center", fig.height = 8, fig.width = 10}
+load("./Outputs/srw.ras.nonmasked.RData")
+plot(srw.ras.nonmasked[["X188"]], main = "Argentina individual example")
+```
+
+```{r, fig.cap = "3-month average of phytoplankton isoscape prior to sample taken in Auckland Islands breeding grounds.", fig.align="center", fig.height = 8, fig.width = 10}
+plot(srw.ras.nonmasked[["X630"]], main = "Auckland Islands individual example")
+```
+
+## Masking
+
+Average position of samples by breeding stock
+```{r}
+srw.data.breeding <- srw.data %>% 
+  group_by(Locality1) %>% 
+  dplyr::summarize(lon = mean(Long, na.rm = T),
+            lat = mean(Lat, na.rm = T))
+srw.data.breeding
+```
+
+Convert breeding region positions to spatial object, project and buffer around with 6500 km. Then crop out the parts of the feeding bubbles that are > 30°S and smaller parts of the bubble that might come up on the other side of the antarctic continent...
+```{r}
+# create circle polygon centered on pole and up to 30°S latitude
+crop_circle <- data.frame(lon = c(0), lat = c(-90)) %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  st_transform(crs = st_crs(proj_antarctic)) %>% 
+  st_buffer(dist = 60*111e3) # one degree of latitude is 111 km
+
+# create buffers around breeding regions
+srw.buf <- st_as_sf(srw.data.breeding, coords = c("lon", 'lat'), crs = 4326) %>%
+  st_transform(crs = st_crs(proj_antarctic)) %>%
+  st_buffer(dist = 6500e3)
+ 
+# crop at 30°S
+srw.buf <-  st_intersection(srw.buf, crop_circle)
+
+srw.buf
+```
+
+```{r, fig.cap = "Basic 6500 km feeding bubble cropped at 30°S.", fig.align="center", fig.height = 6, fig.width = 10}
+ggplot() +
+  geom_sf(data = srw.buf, aes(fill = Locality1), alpha = 0.8) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(~Locality1, ncol = 4) +
+  coord_sf(label_graticule = "") +
+  theme_grey() +
+  theme(legend.position = "bottom") +
+  xlab("") + ylab("")
+```
+
+We also noticed that the phytoplankton isoscapes showed elevated and unusual values in coastal waters around the Antarctic continent (e.g. Ross Sea) so we decided to remove these waters from the analysis.
+```{r, warning = F}
+## crop waters on continental shelf with a buffer around land
+antarctica_buf <- world %>% 
+  filter(continent == "Antarctica") %>% # select antarctica continent
+  st_cast("POLYGON") # convert multipolygon to polygons
+# calculate surface area of polygons
+antarctica_buf$area <- st_area(antarctica_buf)
+# select the mainland only and buffer
+antarctica_buf <- antarctica_buf %>% 
+  filter(area == max(antarctica_buf$area)) %>% 
+  st_buffer(200e3)
+plot(antarctica_buf['continent'])
+
+srw.buf <-  st_difference(srw.buf, antarctica_buf) %>% 
+  dplyr::select(Locality1) # remove useless columns
+
+
+# for argentina and brazil also remove the Pacific side of the bubble
+# tracing a line between Navarino island (-55.169070, -67.611678) and Antarctica (-79, -67.611678)
+exclusion_pacific <- st_read("../Data/polygon_exclusion_pacific.shp") %>% 
+  st_transform(proj_antarctic)
+
+# remove pieces of bubble on the other side of the antarctic continent...
+# for brazil remove the pacific side...
+srw.buf.list <- list()
+for(i in 1:nrow(srw.buf)){
+  srw.buf.i <- srw.buf[i, ]
+  # if Brazil or Argentina, remove pacific part of the buffer
+  if(srw.buf.i$Locality1 %in% c("Brazil", "Argentina", "Argentina_d15Nhigh","Argentina_d15Nhigh", "Argentina_d15Nlow")){
+    srw.buf.i <- st_difference(srw.buf.i, exclusion_pacific) 
+  }
+  srw.buf.i <- srw.buf.i %>% 
+    st_cast("POLYGON", warn = F) # convert multipolygon to polygons
+  # calculate surface area of polygons
+  srw.buf.i$area <- st_area(srw.buf.i)
+  # select the main part of the bubble
+  srw.buf.i <- srw.buf.i %>% 
+    filter(area == max(srw.buf.i$area))
+  srw.buf.list <- c(srw.buf.list, list(srw.buf.i))
+}
+srw.buf <- ldply(srw.buf.list, rbind) %>% 
+  st_as_sf(crs = proj_antarctic)
+
+save(srw.buf, file = "./Outputs/srw.buf.RData")
+```
+
+```{r, fig.cap = "Feeding bubble outside which isoscape assignment will be masked.", fig.align="center", fig.height = 6, fig.width = 10}
+ggplot() +
+  geom_sf(data = srw.buf, aes(fill = Locality1), alpha = 0.8) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(~Locality1, ncol = 4) +
+  coord_sf(label_graticule = "") +
+  theme_grey() +
+  theme(legend.position = "bottom") +
+  xlab("") + ylab("")
+```
+
+Apply same buffer to all individual rasters per breeding ground for masking
+```{r, eval = T}
+srw.ras.masked <- alply(names(srw.ras.nonmasked), .margins = 1, function(n){
+  # go retrieve the Locality
+  l <- srw.data[srw.data$Sample == n, "Locality1"]
+  # rotate individual raster will just convert back -180_180 lon
+  ind <- rotate(srw.ras.nonmasked[[n]])
+  # now project to the antarctic centered crs
+  ind <- projectRaster(ind, crs = crs(proj_antarctic))
+  # apply mask to set cells outside the buffers to NA
+  masked_ras <- raster::mask(ind, st_as_sf(srw.buf[srw.buf$Locality1 == l, ]))
+  return(masked_ras)
+})
+names(srw.ras.masked) <- names(srw.ras.nonmasked)
+
+# Saving these individual Rasters stack
+save(srw.ras.masked, file = "./Outputs/srw.ras.masked.RData")
+```
+
+Check out an example
+```{r, fig.width = 10}
+load("./Outputs/srw.ras.masked.RData")
+plot(srw.ras.masked[["X1000"]]) # auckland islands
+plot(srw.ras.masked[["X5"]]) # south africa
+plot(srw.ras.masked[["X203"]]) # argentina
+```
+
+# Assignment function by individual
+
+## TDF settings
+
+I am applying the best TDF we found in the Auckland Islands - Argentina satellite tracking analysis: TDF is 4.5 for d15N and 3 for d13C
+```{r, eval = F}
+srw.ras.masked.corrected <- llply(srw.ras.masked, function(r){
+    r$D13Cmean <- r$D13Cmean + 3
+    r$D15Nmean <- r$D15Nmean + 4.8
+    return(r)
+})
+save(srw.ras.masked.corrected, file = "./Outputs/srw.ras.masked.corrected.RData")
+```
+
+## Constant parameters
+
+```{r}
+load("./Outputs/srw.ras.masked.corrected.RData")
+## SD_C
+## within individual error: δ13C: 0.45±0.57‰ estimated by Carroll et al in prep
+SD_C<-0.45
+      
+## SD_N
+## within individual error: δ15N: 0.38±0.42‰ estimated by Carroll et al in prep
+SD_N <-0.38
+
+## SD_TEF_C1
+## variance due to trophic enrichment factor or rescaling factor: phyto to zooplankton
+SD_TEF_C1 <- 0.3
+
+## SD_TEF_N1: phyto to zooplankton
+## variance due to trophic enrichment factor or rescaling factor
+SD_TEF_N1 <- 0.3
+
+## SD_TEF_C2: zooplankton to whale
+## variance due to trophic enrichment factor or rescaling factor
+SD_TEF_C2 <- 0.38
+
+## SD_TEF_N2: zooplankton to whale
+## variance due to trophic enrichment factor or rescaling factor
+SD_TEF_N2 <- 0.30
+
+
+## rho
+## correlation between C and N, calculated on a global scale 
+srw.data_rho <- srw.data %>% 
+  filter(!(Locality1 %in% c("Argentina_d15Nhigh", "Argentina_d15Nlow")))
+nrow(srw.data_rho)
+vcm<-cov(cbind(srw.data_rho$D13C, srw.data_rho$D15N))
+VarCovar <- vcm
+rho <- VarCovar[1,2]/(sqrt(VarCovar[1,1])*sqrt(VarCovar[2,2]))
+rho
+```
+
+## Assignment model
+
+From Hannah's code, this is the assignment part. I created a function from it, called Fun_assign
+```{r}
+Fun_assign <- function(individual.isotopes, ras.isoscapes){
+  for (i in 1:nrow(individual.isotopes)){# for each individual in your file
+    # id of that individual
+    name_n <- as.character(individual.isotopes$Sample[i])
+    # select the right rasters for that individual
+    ras <- ras.isoscapes[[name_n]]
+    # select the isotope values for that individual
+    x <- individual.isotopes$D13C[i]
+    y <- individual.isotopes$D15N[i]
+    ## in Hannah's code the next two lines aren't calculated per individual, but if we are generating the raster and its error each loop it needs to be calculated
+    ## each time. Two of these parameters are fixed - within individual and TEF variance, but the SD raster will change
+    error_x <- sqrt((ras$D13Csd)^2 + (SD_C)^2 + (SD_TEF_C1)^2+ (SD_TEF_C2)^2)
+    error_y <- sqrt((ras$D15Nsd)^2 + (SD_N)^2 + (SD_TEF_N1)^2+ (SD_TEF_N2)^2)
+    ## assignment code: added in year here too, but you can tweak it how you want to call that variable however you like!
+    assign <- (1/(2*pi*error_x*error_y*sqrt(1-rho^2))) * (exp(-1/(2*(1-rho^2)) * ((((x-ras$D13Cmean)^2)/(error_x^2)) + (((y-ras$D15Nmean)^2)/(error_y^2))                                                                              -((2*rho*(x-ras$D13Cmean)*(y-ras$D15Nmean) / (error_x*error_y)))))) 
+   writeRaster(assign, 
+      filename = paste0("./Outputs/assignments/assign_", name_n, ".grd"), bylayer=F, overwrite=T)
+  }
+}
+
+# run the function over all samples!
+# outputs are saved directly to disk in the a folder > Outputs > assignments
+# saved as grd files
+Fun_assign(individual.isotopes = srw.data, ras.isoscapes = srw.ras.masked.corrected)
+```
+
+
+# Breeding stock analysis
+
+## Averaging at breeding ground scale
+
+Rescaling individual rasters within a breeding ground so that the sum of probabilities within the bubble is 1. Then averaging individuals together per breeding grounds.
+```{r, eval = F}
+d_ply(srw.data, ~Locality1, function(d){
+      # select names of individuals of interest
+      ind <- as.character(d$Sample)
+      # for each individual and correction setting, go get raster
+      files <- paste0("./Outputs/assignments/assign_", ind, ".grd")
+      ras <- alply(files, .margins = 1, raster)
+      ras <- stack(ras)
+      names(ras) <- ind
+      # rescale the map to sum to 1
+      for (i in ind){
+        ras[[i]] <- ras[[i]]/sum(values(ras[[i]]), na.rm = T)
+      }
+      # average across all individuals sampled in the same breeding ground
+      ras_mean <- mean(ras, na.rm = T)
+      # rename the layer with name of the locality = breeding ground
+      names(ras_mean) <- d$Locality1[1]
+      # save to disk as grd file
+      raster::writeRaster(ras_mean, 
+        filename = paste0("./Outputs/breeding_grounds/assign_", d$Locality1[1], ".grd"), 
+        bylayer=F, overwrite=T)
+})
+
+```
+
+Read the breeding ground raster averages and save to a raster stack
+```{r}
+# vector of unique locality names
+locs <- unique(srw.data$Locality1)
+# list files
+files <- paste0("./Outputs/breeding_grounds/assign_", locs,".grd")
+# read rasters to list
+ras <- alply(files, .margins = 1, raster)
+# stack together
+breeding.ras <- stack(ras)
+names(breeding.ras) <- locs
+
+save(breeding.ras, file = "./Outputs/breeding.ras.RData")
+```
+
+Convert to dataframe
+```{r}
+breeding.df <- as.data.frame(breeding.ras)
+breeding.df[c("x", "y")] <- coordinates(breeding.ras)
+breeding.df <- breeding.df %>% 
+  pivot_longer(cols = c(South.Africa, Brazil, Argentina, Argentina_d15Nlow, Argentina_d15Nhigh, Southwest.Australia,  Southeast.Australia, Auckland.Islands, NZ.Mainland), names_to = 'Locality', values_to = 'proba_origin') %>% 
+    filter(!is.na(proba_origin))
+
+save(breeding.df, file = "./Outputs/breeding.df.RData")
+```
+
+```{r, fig.cap = "Maps of mean assignments by breeding stock", fig.align="center", fig.height = 8, fig.width = 10, warning = F, message = F}
+g <- gbase +
+  geom_tile(data = breeding.df, aes(x, y, fill = proba_origin)) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(~Locality, ncol = 4)
+g
+```
+
+## Classify P(origin) into binomial variable
+
+```{r, fig.cap = "Distribution of the probability of origin across each locality's feeding bubble. Note: Probabilities were rescaled to sum to one for each individual assignment map, before being averaged across individuals of the same breeding stock", fig.align="center", fig.height = 8, fig.width = 10, warning = F, message = F}
+
+# calculate 75 % quantile per locality
+thresh <- breeding.df %>% 
+  group_by(Locality) %>% 
+  dplyr::summarize(proba_threshold =
+                    round(quantile(proba_origin, 0.75), 6))
+
+# plot histogram with 7(% quantile)
+ggplot(breeding.df, aes(proba_origin)) +
+  geom_histogram() +
+  facet_wrap(~Locality, scales = "free_x") +
+  geom_vline(data = thresh, 
+             aes(xintercept =proba_threshold)) +
+  geom_text(data = thresh, aes(
+    x = proba_threshold + 0.022, 
+    y = 400, 
+    label = paste0("Threshold 75% = ",proba_threshold)), 
+    size = 3)
+```
+
+Use threshold to classify P(origin) into a binomial variable using two thresholds: the best 25 % is the core of the distribution whereas the best 50 % is a wider estimate of the feeding zone
+```{r}
+# bin for each breeding raster
+breeding.bin <- breeding.df %>% 
+  group_by(Locality) %>% 
+  mutate(feeding0.25 = ifelse(proba_origin >= quantile(proba_origin, 0.75, na.rm = T), 1, NA),
+         feeding0.50 = ifelse(proba_origin >= quantile(proba_origin, 0.5, na.rm = T), 1, NA)) %>% 
+  filter(!(is.na(feeding0.25) & is.na(feeding0.50)))
+
+save(breeding.bin, file = "./Outputs/breeding.bin.RData")
+```
+
+```{r, fig.cap = "Population level feeding areas", fig.align="center", fig.height = 8, fig.width = 8, warning = F}
+g <- ggplot() +
+  coord_sf(label_graticule = "") +
+  theme_light() +
+  theme(legend.position = "") +
+  xlab("") + ylab("") +
+  geom_tile(data = breeding.bin[!is.na(breeding.bin$feeding0.50), ], aes(x, y, fill = Locality), alpha = 0.5) +
+  geom_tile(data = breeding.bin[!is.na(breeding.bin$feeding0.25), ], aes(x, y, fill = Locality), alpha = 1) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(~Locality, ncol = 3)
+
+ggsave(g, file = "./Outputs/Population_feeding_grounds.png", width = 8, height = 8)
+g
+```
+
+```{r, fig.cap = "Population level feeding areas", fig.align="center", fig.height = 3, fig.width = 7, warning = F}
+g <- ggplot() +
+  coord_sf(label_graticule = "") +
+  theme_light() +
+  theme(legend.position = "right") +
+  scale_color_discrete(guide = "none") +
+  xlab("") + ylab("") +
+  geom_tile(data = breeding.bin, aes(x, y, fill = Locality), alpha = 0.7) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  geom_sf_label_repel(data = labels_sites, 
+         aes(label = Locality, col = Locality), nudge_x = -10e5, nudge_y = 10e3, segment.size = 0, box.padding = 1, size = 2, force = 1)
+g
+ggsave(g, file = "./Outputs/Population_feeding_grounds_overlap.png", width = 7, height = 5)
+```
+
+## Calculate overlap across breeding stocks
+
+Overlap is calculated across the general feeding areas (50 % contours) assigned to each breeding stock
+```{r}
+# convert the binomial assignments back to a spatial point format
+allfeeding <- breeding.bin %>% 
+      filter(!is.na(feeding0.50)) %>% 
+      dplyr::select(-c(proba_origin, feeding0.25, feeding0.50)) %>% 
+      st_as_sf(coords = c("x", "y"), crs = st_crs(proj_antarctic)) 
+# st_agr just prevents warning in st_intersection
+st_agr(allfeeding) = "constant"
+
+  
+breeding.overlap <- breeding.bin %>% 
+  group_by(Locality) %>% 
+  nest() %>% 
+  mutate(data = map(data, function(d){ #select the feeding zones 50 % in each locality
+    d %>% 
+      filter(!is.na(feeding0.50)) %>% 
+      dplyr::select(-c(proba_origin, feeding0.25, feeding0.50)) %>% 
+      st_as_sf(coords = c("x", "y"), crs = st_crs(proj_antarctic))
+  }),
+  overlap_feeding = map(data, function(d){ #intersect the full dataset of 50 % feeding ground with each feeding locality group of cells
+    st_agr(d) = "constant"
+    d %>% 
+      st_intersection(allfeeding, warning = F)
+  }),
+  percent_overlap = map2(data, overlap_feeding, function(x, y){
+    y %>% 
+      group_by(Locality) %>% 
+      summarize(nb_overlap_cells = n(), # nb of overlap cells by locality
+                percent_overlap = round(nb_overlap_cells / nrow(x) *100, 0)) %>% # divide by total number of cells
+      rename(Locality_overlapping = Locality)
+  }))
+
+# set order of locality in which we want them to appear in the csv
+locs <- c("Argentina", "Argentina_d15Nlow", "Argentina_d15Nhigh", "Brazil", "South.Africa", "Southwest.Australia", "Southeast.Australia", "NZ.Mainland", "Auckland.Islands")
+
+# pull the relevant data from the tibble and pivot to create a table to export as csv
+breeding.overlap %>% 
+  unnest(percent_overlap) %>% 
+  dplyr::select(-c(data, overlap_feeding, nb_overlap_cells, geometry)) %>% 
+  mutate(Locality = factor(Locality, levels = locs)) %>%
+  arrange(Locality) %>% # order the rows
+  pivot_wider(names_from = Locality_overlapping, values_from = percent_overlap) %>%
+  dplyr::select(locs) %>% # reorder the columns in same order as rows
+  replace(is.na(.), 0) %>% # NA means there was zero overlap between the two breeding stocks
+  print(n = Inf) %>% 
+  write.csv(file = "./Outputs/Table_overlap_breedingstocks.csv", row.names = F)
+```
+
+## Individual level maps
+
+Now instead of averaging individual maps by breeding stocks, I will just load them, rescale them to sum to 1 and return them in a list called ind_assign
+```{r}
+ind_assign <- dlply(srw.data, ~Locality1, function(d){
+  # select names of individuals of interest
+  ind <- as.character(d$Sample)
+  # for each individual go get raster
+  files <- paste0("./Outputs/assignments/assign_", ind,".grd")
+  ras <- alply(files, .margins = 1, raster)
+  ras <- stack(ras)
+  names(ras) <- ind
+  # rescale the map to sum to 1
+  for (i in ind){
+    ras[[i]] <- ras[[i]]/sum(values(ras[[i]]), na.rm = T)
+  }
+  return(ras)
+})
+```
+
+Bin all individual rasters at 50% quantile, sum and calculate percent of individuals assigned to each pixel
+```{r}
+## bin the individual rasters and sum them by locality1
+ind_bin_sum_df <- ldply(ind_assign, .id = "Locality1", function(r){
+  for (i in names(r)){
+    q <-  quantile(values(r[[i]]), 0.5, na.rm = T)
+    reclass <- matrix(c(0, q, 0,
+                        q, Inf, 1),
+                        ncol = 3,
+                        byrow = TRUE)
+    r[[i]] <- reclassify(r[[i]], reclass)
+  }
+  # sum individual layers after binned
+  r_sum <- sum(r, na.rm = T)
+  # convert to dataframe
+  df <- as.data.frame(r_sum)
+  df[c("x", "y")] <- coordinates(r_sum)
+  df <- df %>% 
+    rename(sum_ind_feeding = layer) %>% 
+    filter(!is.na(sum_ind_feeding), sum_ind_feeding != 0) # remove cells with no assignment
+  return(df)
+})
+
+## join the dataframe with the number of samples per locality1 so we can convert sum_ind_feeding into percent_ind_feeding
+nb_samples <- srw.data %>% 
+  group_by(Locality1) %>% 
+  dplyr::summarize(nb_ind = length(unique(Sample)))
+nb_samples
+ind_bin_sum_df <- ind_bin_sum_df %>% 
+  join(nb_samples, by = "Locality1") %>% 
+  mutate(percent_ind_feeding = round(sum_ind_feeding / nb_ind *100, digits = 0))
+# check the distrib of the percentages
+summary(ind_bin_sum_df$percent_ind_feeding)
+
+save(ind_bin_sum_df, file = "./Outputs/ind_bin_sum_df.RData")
+```
+
+```{r, fig.cap = "Population level feeding areas", fig.align="center", fig.height = 3, fig.width = 7, warning = F}
+g <- ggplot() +
+  coord_sf(label_graticule = "") +
+  theme_grey() +
+  theme(legend.position = "bottom") +
+  xlab("") + ylab("") +
+  geom_tile(data = ind_bin_sum_df, aes(x, y, fill = percent_ind_feeding), alpha = 1) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  scale_fill_viridis_c() +
+  facet_wrap(~Locality1)
+ggsave(g, file = "./Outputs/Individual_feeding_grounds.png", width = 8, height = 8)
+g
+```
+
+
+# Decadal analysis
+
+## Sample distribution across decades
+
+```{r}
+# create new column to indicate what decade the sample was collected in
+srw.data <- srw.data %>% 
+  mutate(decade = case_when(Year < 2000 ~ "1994-1999",
+                            Year >= 2000 & Year <= 2009 ~ "2000-2009",
+                            Year >= 2010 ~ "2010-2020")) 
+
+# plot the temporal distribution of samples
+g <- ggplot(srw.data, aes(Locality1, Year, col = decade)) +
+    geom_jitter(width = 0.2, height = 0, alpha = 0.6) +
+    theme_light() +
+    xlab("Breeding population")
+ggsave(g, file = "./Outputs/samples_by_decades.png", width = 10, height = 5)
+g
+```
+
+## Averaging by breeding ground x decade
+
+Rescaling individual rasters to scale to 1. Then averaging individuals together per breeding grounds x decade.
+```{r, eval = T}
+d_ply(srw.data[!(srw.data$Locality1 %in% c("Argentina", "Argentina_d15Nhigh", "Argentina_d15Nlow")), ], .(Locality1, decade), function(d){
+      # select names of individuals of interest
+      ind <- as.character(d$Sample)
+      # for each individual and correction setting, go get raster
+      files <- paste0("./Outputs/assignments/assign_", ind, ".grd")
+      ras <- alply(files, .margins = 1, raster)
+      ras <- stack(ras)
+      names(ras) <- ind
+      # rescale the map to sum to 1
+      for (i in ind){
+        ras[[i]] <- ras[[i]]/sum(values(ras[[i]]), na.rm = T)
+      }
+      # average across all individuals sampled in the same breeding ground
+      ras_mean <- mean(ras, na.rm = T)
+      names(ras_mean) <- d$Locality1[1]
+      raster::writeRaster(ras_mean, 
+        filename = paste0("./Outputs/breeding_grounds_decade/assign_", d$Locality1[1],"_", d$decade[1], ".grd"), 
+        bylayer=F, overwrite=T)
+})
+
+```
+
+Read the breeding ground x decade raster averages and save to a raster stack
+```{r}
+# retrieve the names of the .grd files by decade by breeding ground
+ff <- list.files("./Outputs/breeding_grounds_decade/", pattern = "\\.grd$")
+# read and convert to a dataframe
+decades.df <- ldply(ff, function(file){
+  # read raster
+  ras <- raster(paste0("./Outputs/breeding_grounds_decade/", file))
+  # convert to dataframe
+  df <- as.data.frame(ras)
+  names(df) <- "proba_origin"
+  df[c("x", "y")] <- coordinates(ras)
+  name_file <- strsplit(file, "_")[[1]]
+  # retrieve the locality and the decade from the name of the file and add in separate columns to the dataframe
+  df$Locality <- name_file[2] 
+  df$decade <- strsplit(name_file[3], ".grd")[[1]][1]
+  return(df)
+})
+
+save(decades.df, file = "./Outputs/decades.df.RData")
+
+```
+
+## Classify P(origin) into binomial variable
+
+```{r}
+decades.bin <- decades.df %>% 
+  group_by(Locality, decade) %>% 
+  mutate(feeding0.25 = ifelse(proba_origin >= quantile(proba_origin, 0.75, na.rm = T), 1, NA),
+         feeding0.50 = ifelse(proba_origin >= quantile(proba_origin, 0.5, na.rm = T), 1, NA)) %>% 
+  filter(!(is.na(feeding0.25) & is.na(feeding0.50)))
+
+save(decades.bin, file = "./Outputs/decades.bin.RData")
+```
+
+```{r, fig.cap = "Population level feeding areas by decades", fig.align="center", fig.height = 9, fig.width = 8, warning = F}
+g <- ggplot() +
+  coord_sf(label_graticule = "") +
+  theme_light() +
+  theme(legend.position = "") +
+  xlab("") + ylab("") +
+  geom_tile(data = decades.bin[!is.na(decades.bin$feeding0.50), ], aes(x, y, fill = Locality), alpha = 0.7) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(Locality~decade, ncol = 4)
+g
+ggsave(g, file = "./Outputs/Population_decade_feeding_grounds.png", width = 8, height = 9)
+```
+
+# Whaling data
+
+## Load Yankee and Soviet whaling data
+
+```{r}
+files <- as.list(c("../Data/Historial Whaling data/R/Yankee_Whaling_Data_aowl_SRW.csv", 
+           "../Data/Historial Whaling data/R/Soviet_SRW_catches.csv"))
+
+# load files, put in spatial format and project
+# filtering on months based on range across srw.data being 6 to 10. +/- 3 to 5
+# potential range of months for whaling will therefore be january (1) to July (7)
+# the soviet and yankee data are not under the same format so we are making two different pathways in the function
+whaling_df <- tibble(files) %>% 
+  mutate(source = c("Yankee", "Soviet")) %>% 
+  mutate(data = map(files, read.csv)) %>% 
+  dplyr::select(-files) %>% 
+  mutate(data = map2(data, source, function(d, s){
+    if(s == "Yankee"){
+      d <- d %>% # select only the months we are interested in
+        filter(Month %in% c(1:7), Lat <= -30) %>% 
+        st_as_sf(coords = c("Long", "Lat"), crs = 4326) %>% # convert sf
+        st_transform(crs = st_crs(proj_antarctic)) %>% # project
+        mutate(decade = floor(Year/10)*10) %>% 
+        dplyr::select(decade, Month, Year, geometry) %>% 
+        dplyr::rename(month = Month, year = Year)
+      return(d)
+    }
+    if(s == "Soviet"){
+      d <- d %>% # select only the months we are interested in
+        filter(month %in% c(1:7), Latitude <= -30) %>% 
+        st_as_sf(coords = c("Longitude","Latitude"), crs = 4326) %>% 
+        st_transform(crs = st_crs(proj_antarctic)) %>% 
+        mutate(year = year + 1900,
+               decade = floor(year/10)*10) %>% 
+        dplyr::select(decade, month, year, geometry)
+      return(d)
+    }
+  })) %>% 
+  unnest(data)
+
+# number of records (each row is one whale)
+nrow(whaling_df)
+# temporal distribution of records
+summary(whaling_df$year)
+# number of records by source
+table(whaling_df$source)
+# number of records by source and by decade
+whaling_df %>% 
+  group_by(source, decade) %>% 
+  dplyr::summarize(nb_records = n())
+
+save(whaling_df, file = "./Outputs/whaling_df.RData")
+```
+
+Selecting only the points that fall within the feeding bubbles
+```{r}
+# in this dataframe, the whaling points overlapping with multiple feeding bubbles will be repeated
+whaling_inbubbles_df <- whaling_df %>% 
+  st_as_sf() %>% 
+  mutate(index = seq(1:nrow(whaling_df))) %>% 
+  st_intersection(srw.buf) %>% 
+  mutate(Locality = sub(" ", ".", Locality1))
+
+# number of records left
+length(unique(whaling_inbubbles_df$index))
+
+save(whaling_inbubbles_df, file = "./Outputs/whaling_inbubbles_df.RData")
+```
+
+## Map whaling catches over feeding areas
+
+```{r, fig.cap = "Population level feeding areas overlapped with whaling data", fig.align="center", fig.height = 8, fig.width = 8, warning = F}
+g <- ggplot() +
+  coord_sf(label_graticule = "") +
+  theme_light() +
+  theme(legend.position = "") +
+  xlab("") + ylab("") +
+  geom_tile(data = breeding.bin, aes(x, y, fill = Locality), alpha = 0.7) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(~Locality, ncol = 3) +
+  geom_sf(data = whaling_df, aes(geometry = geometry, col = source), size = 0.5, alpha = 0.8) +
+  scale_color_manual(values = c("grey", "black"))
+
+ggsave(g, file = "./Outputs/Population_feeding_grounds_whaling.png", width = 8, height = 8)
+g
+```
+
+```{r, fig.cap = "Population level feeding areas overlapped with whaling data by area", fig.align="center", fig.height = 8, fig.width = 8, warning = F}
+g <- ggplot() +
+  coord_sf(label_graticule = "") +
+  theme_light() +
+  theme(legend.position = "") +
+  xlab("") + ylab("") +
+  geom_tile(data = breeding.bin, aes(x, y, fill = Locality), alpha = 0.7) +
+  geom_sf(data = world, col = "transparent", fill = "grey15") +
+  facet_wrap(~Locality, ncol = 3) +
+  geom_sf(data = whaling_inbubbles_df, aes(geometry = geometry), size = 0.5, alpha = 0.8)
+
+ggsave(g, file = "./Outputs/Population_feeding_grounds_whaling_inzones.png", width = 8, height = 8)
+g
+```
+
+## Calculate overlap
+
+```{r}
+# grid example used to rasterize points and calculate overlap
+breeding.ras
+
+# convert feeding areas 50 % and 25 % to polygons
+breeding.pol <- breeding.bin %>% 
+  pivot_longer(cols = c(feeding0.25, feeding0.50), names_to = "feeding_ground", values_to = "feeding_value") %>% 
+  filter(!is.na(feeding_value)) %>% 
+  dplyr::select(-feeding_value) %>% 
+  group_by(Locality, feeding_ground) %>% 
+  nest() %>% 
+  mutate(feeding_pol = map(data, function(d){
+    d %>% 
+      st_as_sf(coords = c("x", "y"), crs = st_crs(proj_antarctic)) %>% 
+      rasterize(., breeding.ras) %>% 
+      st_as_stars() %>% 
+      st_as_sf(as_points = FALSE, merge = TRUE) %>% 
+      st_as_sf()
+  })) %>% 
+  unnest(feeding_pol) %>% 
+  st_as_sf()
+st_agr(breeding.pol) <- "constant"
+
+# calculate intersection
+whaling_overlap_df <- whaling_inbubbles_df %>% 
+  dplyr::select(source, decade, month, year, index, Locality) %>% 
+  group_by(Locality) %>% 
+  nest() %>% 
+  mutate(overlap = map2(Locality, data, function(l, d){
+            st_agr(d) <- "constant"
+            d %>% 
+              st_intersection(breeding.pol[breeding.pol$Locality == l, ])}),
+        percent_overlap = map2(data, overlap, function(all_p, in_p){
+            in_p %>% 
+              group_by(feeding_ground) %>% 
+              dplyr::summarize(nb_overlap_points = n(), # nb of overlap cells by locality then divide by total number of whaling points for that locality
+                percent_overlap = round(nb_overlap_points / nrow(all_p) *100, 0))})) 
+
+# set order of locality in which we want them to appear
+locs <- c("Argentina", "Argentina_d15Nlow", "Argentina_d15Nhigh", "Brazil", "South.Africa", "Southwest.Australia", "Southeast.Australia", "NZ.Mainland", "Auckland.Islands")
+
+# convert to csv to export
+whaling_overlap_df %>% 
+  unnest(percent_overlap) %>% 
+  dplyr::select(-c(data, overlap, nb_overlap_points, geometry)) %>% 
+  mutate(Locality = factor(Locality, levels = locs)) %>%
+  arrange(Locality) %>% 
+  pivot_wider(names_from = feeding_ground, values_from = percent_overlap) %>%
+  replace(is.na(.), 0) %>% 
+  print(n = Inf) %>% 
+  write.csv(file = "./Outputs/Table_overlap_whalingrecords.csv", row.names = F)
+
+```
+
+## Calculate correlation nb_records ~ proba feeding
+
+Summing the number of whaling records per pixel and then looking at the correlation between nb of records and mean probability of feeding
+```{r}
+whaling_gridded <- ddply(whaling_inbubbles_df, ~Locality, function(d){
+  # rasterize by summing counts of animals within cells
+  # each record is one whale so add a column to indicate that number and then sum
+  d$count <- 1
+  # set the grid to the relevant breeding ground
+  grid <- breeding.ras[[d$Locality[1]]]
+  # rasterize
+  d <- d %>% 
+      st_as_sf() %>% 
+      rasterize(., grid, field = "count", fun = "sum") 
+  # combine the probabilities from grid to the rasterized whaling records from d
+  out <- cbind(as.data.frame(grid), as.data.frame(d))
+  names(out) <- c("proba_feeding", "nb_whaling")
+  out <- out %>% 
+    filter(!is.na(proba_feeding)) %>% # remove cells outside feeding bubbles
+    mutate_all(~replace(., is.na(.), 0)) # replace na by zeros in nb_whaling because it means there was no records in that cell and we want to account for that
+  return(out)
+})
+
+save(whaling_gridded, file = "./Outputs/whaling_gridded.RData")
+```
+
+
+```{r}
+ggplot(whaling_gridded, aes(nb_whaling, proba_feeding, col = Locality)) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~Locality, scales = "free")
+
+# log-transformed version
+g <- ggplot(whaling_gridded, aes(log(nb_whaling + 1), log(proba_feeding))) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~Locality, scales = "free") +
+  stat_smooth(method='lm', formula = y~poly(x,2), col= "grey20")
+g
+
+ggsave(g, file = "./Outputs/Correlation_whaling_proba.png", width = 8, height = 8)
+
+# calculate spearman coefficient of correlation (data not gaussian)
+cor_fun <- function(df) cor.test(df$proba_feeding, df$nb_whaling, method="spearman", exact = F) %>% broom::tidy()
+
+Fun_whalingcor <- function(df) nest(df) %>% 
+  mutate(model = purrr::map(data, cor_fun)) %>% 
+  dplyr::select(-data) %>% 
+  unnest(cols = c(model))
+
+whaling_gridded %>% 
+  group_by(Locality) %>% 
+  Fun_whalingcor() 
+```
+
+
+Save data
+```{r}
+save(srw.data, file = "./Outputs/srw.data.RData")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
